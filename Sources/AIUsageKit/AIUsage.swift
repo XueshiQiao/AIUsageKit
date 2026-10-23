@@ -80,6 +80,7 @@ public enum AIUsage {
     private static func fetchUnbounded(_ provider: AIProvider) async throws -> ProviderUsage {
         let route = self.route(for: provider)
         let browser = BrowserDetection()
+        let env = self.environment()
         let context = ProviderFetchContext(
             runtime: .cli,
             sourceMode: route.sourceMode,
@@ -87,10 +88,11 @@ public enum AIUsage {
             webTimeout: 20,
             webDebugDumpHTML: false,
             verbose: false,
-            env: self.environment(),
+            env: env,
             settings: nil,
             fetcher: UsageFetcher(),
-            claudeFetcher: ClaudeUsageFetcher(browserDetection: browser),
+            // Claude 的取数器自己也带一份环境变量（起 `claude` 子进程用），要和上面保持一致。
+            claudeFetcher: ClaudeUsageFetcher(browserDetection: browser, environment: env, runtime: .cli),
             browserDetection: browser)
 
         // background：任何可能弹窗（钥匙串等）的路径都会被跳过，而不是打断用户。
