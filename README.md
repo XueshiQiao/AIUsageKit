@@ -13,8 +13,9 @@ A small Swift package that reads the **real subscription usage** of your AI codi
 It is a thin, opinionated wrapper around `CodexBarCore`, the library inside [CodexBar](https://github.com/steipete/CodexBar) by Peter Steinberger (MIT). The heavy lifting — talking to each provider — is CodexBar's. This package only:
 
 1. **Pins one safe data path per provider.** Every provider is read through its own official CLI (`claude`, `agy`, `grok`). No browser cookies, no reading Claude Code's Keychain item, no permission prompts. Token refresh stays with each CLI.
-2. **Normalizes the result** into one simple `UsageWindow` type.
-3. **Absorbs upstream churn.** `CodexBarCore` ships almost daily and its API is not stable; the version is pinned here so your app doesn't have to care.
+2. **Coordinated cross-process cache & single-flight locks.** Per-provider caches and `flock` locks live in `~/Library/Caches/AIUsageKit/v1/<provider>.json` (`accountEmail` stripped). When multiple apps use `AIUsageKit` on the same Mac, only one spawns the CLI while the others reuse the fresh snapshot or receive live `DistributedNotificationCenter` updates. Detailed logs are written to `~/Library/Caches/AIUsageKit/logs/usage.log`.
+3. **Normalizes the result** into one simple `UsageWindow` type.
+4. **Absorbs upstream churn.** `CodexBarCore` ships almost daily and its API is not stable; the version is pinned here so your app doesn't have to care.
 
 > Personal project, shared as-is. It works for me on macOS 26 with the CLIs listed below; no promise of support or prompt updates when providers change.
 

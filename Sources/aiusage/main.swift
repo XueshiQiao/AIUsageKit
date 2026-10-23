@@ -2,13 +2,31 @@ import AIUsageKit
 import Foundation
 
 // 用法：
-//   aiusage                      # 三家都取，表格输出
+//   aiusage                      # 三家都取（默认复用 180 秒内跨进程缓存），表格输出
+//   aiusage --fresh              # 强制穿透旧缓存刷新（maxAge=0）
+//   aiusage --max-age 60         # 自定义跨进程缓存有效期（秒）
 //   aiusage claude grok          # 只取指定的
 //   aiusage --json antigravity   # JSON 输出（含 elapsedPercent）
+//   aiusage --timeout 10         # 单次超时秒数（默认 60）
 
 var args = Array(CommandLine.arguments.dropFirst())
 let json = args.contains("--json")
 args.removeAll { $0 == "--json" }
+
+let fresh = args.contains("--fresh")
+args.removeAll { $0 == "--fresh" }
+
+var maxAge: TimeInterval = fresh ? 0 : AIUsage.defaultCacheMaxAge
+if let i = args.firstIndex(of: "--max-age"), i + 1 < args.count, let m = TimeInterval(args[i + 1]) {
+    maxAge = m
+    args.removeSubrange(i...(i + 1))
+}
+
+var timeout: TimeInterval = 60
+if let i = args.firstIndex(of: "--timeout"), i + 1 < args.count, let t = TimeInterval(args[i + 1]) {
+    timeout = t
+    args.removeSubrange(i...(i + 1))
+}
 
 var providers: [AIProvider] = []
 for arg in args {
@@ -20,7 +38,7 @@ for arg in args {
 }
 if providers.isEmpty { providers = AIProvider.allCases }
 
-let results = await AIUsage.fetchAll(providers)
+let results = await AIUsage.fetchAll(providers, maxAge: maxAge, timeout: timeout)
 let now = Date()
 
 if json {

@@ -13,8 +13,9 @@
 底层是 Peter Steinberger 的 [CodexBar](https://github.com/steipete/CodexBar) 里的 `CodexBarCore` 库（MIT，只用库，不装 App）。跟各家打交道的脏活都是 CodexBar 干的，这一层只做三件事：
 
 1. **写死每家的取数路径**：都是调各家自己的官方命令行（`claude`、`agy`、`grok`）。不读浏览器 Cookie，不读 Claude Code 的钥匙串，不弹窗。token 过期由各家命令行自己刷新。
-2. **统一数据格式**：整理成同一种 `UsageWindow`。
-3. **挡住上游接口变化**：`CodexBarCore` 几乎每天发版、接口不承诺稳定。版本固定在这里，用它的 App 不用操心。
+2. **跨进程共享缓存与单飞互斥**：缓存与 `flock` 文件锁按厂商拆分在 `~/Library/Caches/AIUsageKit/v1/<provider>.json`（自动剔除 `accountEmail`），本机多个 App 同时运行时，同一家同一时间只有一个进程起 CLI，刷完通过 `DistributedNotificationCenter` 广播给其他 App。详细调试日志记在 `~/Library/Caches/AIUsageKit/logs/usage.log`。
+3. **统一数据格式**：整理成同一种 `UsageWindow`。
+4. **挡住上游接口变化**：`CodexBarCore` 几乎每天发版、接口不承诺稳定。版本固定在这里，用它的 App 不用操心。
 
 > 个人项目，原样分享。我在 macOS 26 上配合下面这些命令行在用；各家接口变化时不保证及时跟进。
 

@@ -108,8 +108,27 @@ public struct ProviderUsage: Codable, Equatable, Sendable {
 }
 
 public struct AIUsageError: Error, LocalizedError, Sendable {
+    public enum Kind: String, Sendable {
+        /// 厂商 / 命令行返回的错误（未登录、接口报错等）。
+        case failed
+        /// 超时。已经清理了这次启动的子进程。
+        case timeout
+        /// 这一家上一次取数还没真正结束，这次没有启动新进程。
+        case busy
+    }
+
     public let provider: AIProvider
     public let message: String
+    public let kind: Kind
+
+    public init(provider: AIProvider, message: String, kind: Kind = .failed) {
+        self.provider = provider
+        self.message = message
+        self.kind = kind
+    }
+
+    public var isTimeout: Bool { self.kind == .timeout }
+    public var isBusy: Bool { self.kind == .busy }
 
     public var errorDescription: String? {
         "\(self.provider.displayName): \(self.message)"
