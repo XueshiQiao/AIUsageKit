@@ -7,9 +7,9 @@ import Foundation
 /// 1. **零敏感信息**：只记时间戳、`进程名:PID`、`provider`、事件名与纯数值/标识符键值对；绝不写邮箱、token、路径或原始错误正文。
 /// 2. **多进程并发安全**：每条日志独立 `open(O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)` → 单次 `write` 整行 → `close`，
 ///    这样即使另一个进程刚刚轮转了 `usage.log`，也不会继续往旧 inode（`usage.log.1`）里写。
-/// 3. **安全轮转**：超过 2MB 时，通过 `rotate.lock`（`flock(LOCK_EX | LOCK_NB)`）互斥执行 `rename`，避免多进程同时覆盖备份。
+/// 3. **安全轮转**：超过 5MB 时，通过 `rotate.lock`（`flock(LOCK_EX | LOCK_NB)`）互斥执行 `rename`（保留 `usage.log` + `usage.log.1` 共 10MB，足够留存数周详细分流日志）。
 public enum UsageLogger {
-    private static let maxLogBytes: off_t = 2 * 1024 * 1024
+    private static let maxLogBytes: off_t = 5 * 1024 * 1024
 
     /// 默认日志文件路径：`~/Library/Caches/AIUsageKit/logs/usage.log`。
     public static var defaultLogFileURL: URL {

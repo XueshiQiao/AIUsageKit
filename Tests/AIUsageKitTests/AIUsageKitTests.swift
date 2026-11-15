@@ -226,3 +226,393 @@ actor Counter {
     func increment() { self.count += 1 }
     func value() -> Int { self.count }
 }
+
+actor FlagBox {
+    private var flag = false
+    func setTrue() { self.flag = true }
+    func get() -> Bool { self.flag }
+}
+
+@Suite(.serialized)
+struct AntigravityHardeningTests {
+    func makeTempDir() -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIUsageKitAgyTests-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    func antigravityUsage(
+        used: Double = 21,
+        plan: String? = "Google AI Ultra",
+        resetsAt: Date = Date().addingTimeInterval(3600),
+        fetchedAt: Date = Date(),
+        source: String = "antigravity.cli-https"
+    ) -> ProviderUsage {
+        ProviderUsage(
+            provider: .antigravity,
+            plan: plan,
+            accountEmail: nil,
+            windows: [
+                UsageWindow(
+                    id: "antigravity.gemini-5h",
+                    title: "Gemini 5-hour",
+                    group: "Gemini",
+                    kind: .session,
+                    usedPercent: used,
+                    resetsAt: resetsAt,
+                    windowSeconds: 5 * 3600
+                ),
+                UsageWindow(
+                    id: "antigravity.gemini-weekly",
+                    title: "Gemini weekly",
+                    group: "Gemini",
+                    kind: .weekly,
+                    usedPercent: 11,
+                    resetsAt: resetsAt.addingTimeInterval(86400),
+                    windowSeconds: 7 * 86400
+                ),
+            ],
+            fetchedAt: fetchedAt,
+            source: source
+        )
+    }
+
+    func writeStatusLineJSON(
+        to url: URL,
+        mtime: Date,
+        planTier: String? = "Google AI Ultra",
+        gemini5hRemaining: Double = 0.75,
+        gemini5hReset: Date,
+        otherReset: Date
+    ) throws {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        var root: [String: Any] = [
+            "quota": [
+                "gemini-5h": [
+                    "remaining_fraction": gemini5hRemaining,
+                    "reset_time": iso.string(from: gemini5hReset),
+                ],
+                "gemini-weekly": [
+                    "remaining_fraction": 0.88,
+                    "reset_time": iso.string(from: otherReset),
+                ],
+                "3p-5h": [
+                    "remaining_fraction": 1.0,
+                    "reset_time": iso.string(from: otherReset),
+                ],
+                "3p-weekly": [
+                    "remaining_fraction": 0.90,
+                    "reset_time": iso.string(from: otherReset),
+                ],
+                "gemini-argon-wtu-weekly": [
+                    "remaining_fraction": 0.95,
+                    "reset_time": iso.string(from: otherReset),
+                ],
+            ],
+        ]
+        if let planTier {
+            root["plan_tier"] = planTier
+        }
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        try data.write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: url.path)
+    }
+
+    @Test func environmentSanitizesSSHEnvAndDisablesAutoUpdate() {
+        let dirty: [String: String] = [
+            "PATH": "/usr/bin:/bin",
+            "SSH_CONNECTION": "100.64.0.1 54321 100.64.0.2 22",
+            "SSH_CLIENT": "100.64.0.1 54321 22",
+            "SSH_TTY": "/dev/ttys009",
+            "CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT": "1",
+            "HOME": "/Users/tester",
+        ]
+        let clean = AIUsage.environment(from: dirty)
+        #expect(clean["SSH_CONNECTION"] == nil)
+        #expect(clean["SSH_CLIENT"] == nil)
+        #expect(clean["SSH_TTY"] == nil)
+        #expect(clean["CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT"] == nil)
+        #expect(clean["AGY_CLI_DISABLE_AUTO_UPDATE"] == "true")
+        #expect(clean["PATH"]?.contains("/opt/homebrew/bin") == true)
+    }
+
+    @Test func statusLineParsesPlanTierRelaxesMaxAgeAndSyncsCacheWhenNewerThanStoredAt() async throws {
+        let base = self.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let now = Date()
+        let statusLineURL = base.appendingPathComponent("statusline.json")
+
+        // 1. mtime 在 250s 前（超过旧版 120s，但在 max(180, 300)=300s 内），应命中并解析出 plan_tier
+        try self.writeStatusLineJSON(
+            to: statusLineURL,
+            mtime: now.addingTimeInterval(-250),
+            planTier: "Google AI Ultra",
+            gemini5hRemaining: 0.72,
+            gemini5hReset: now.addingTimeInterval(3600),
+            otherReset: now.addingTimeInterval(86400)
+        )
+        let parsedWithin300 = SharedCache.readFreshAntigravityStatusLine(
+            maxAge: 180,
+            cachedStoredAt: nil,
+            fileURL: statusLineURL,
+            now: now
+        )
+        #expect(parsedWithin300?.plan == "Google AI Ultra")
+        #expect(parsedWithin300?.windows.count == 5)
+        #expect(parsedWithin300?.window(id: "antigravity.gemini-5h")?.usedPercent == 28)
+
+        // 2. 若其中任一桶（如 gemini-5h）已过 resetsAt，即使其余 4 桶未过期也必须整份拒绝（不得漏桶放行）
+        try self.writeStatusLineJSON(
+            to: statusLineURL,
+            mtime: now.addingTimeInterval(-10),
+            planTier: "Google AI Ultra",
+            gemini5hRemaining: 0.5,
+            gemini5hReset: now.addingTimeInterval(-5),
+            otherReset: now.addingTimeInterval(86400)
+        )
+        #expect(SharedCache.readFreshAntigravityStatusLine(
+            maxAge: 240,
+            cachedStoredAt: nil,
+            fileURL: statusLineURL,
+            now: now
+        ) == nil)
+
+        // 3. mtime 在 420s 前（超出 300s），但比本地缓存 storedAt (600s 前) 更新 -> fetchCoordinated 直接采纳并落盘，0 次 CLI
+        let oldCached = self.antigravityUsage(used: 10, resetsAt: now.addingTimeInterval(3600), fetchedAt: now.addingTimeInterval(-600))
+        SharedCache.writeSuccess(oldCached, now: now.addingTimeInterval(-600), baseDirectory: base)
+
+        try self.writeStatusLineJSON(
+            to: statusLineURL,
+            mtime: now.addingTimeInterval(-420),
+            planTier: "Google AI Ultra",
+            gemini5hRemaining: 0.60,
+            gemini5hReset: now.addingTimeInterval(3600),
+            otherReset: now.addingTimeInterval(86400)
+        )
+
+        let cliCalls = Counter()
+        let adopted = try await AIUsage.fetchCoordinated(
+            .antigravity,
+            maxAge: 240,
+            timeout: 20,
+            baseDirectory: base,
+            statusLineURL: statusLineURL,
+            antigravityActivityURLs: [],
+            liveFetcher: {
+                await cliCalls.increment()
+                return self.antigravityUsage(used: 99)
+            }
+        )
+        #expect(await cliCalls.value() == 0)
+        #expect(adopted.plan == "Google AI Ultra")
+        #expect(adopted.window(id: "antigravity.gemini-5h")?.usedPercent == 40)
+
+        // 验证已同步写入 SharedCache 与详细决策日志
+        let diskRecord = SharedCache.readRecord(for: .antigravity, baseDirectory: base)
+        #expect(diskRecord?.plan == "Google AI Ultra")
+        #expect(diskRecord?.source == "antigravity.statusline-file")
+        #expect((diskRecord?.storedAt ?? .distantPast) >= now.addingTimeInterval(-2))
+
+        let slLog = try String(contentsOf: base.appendingPathComponent("logs/usage.log"), encoding: .utf8)
+        #expect(slLog.contains("STATUSLINE_HIT trigger=newer_than_cache"))
+        #expect(slLog.contains("plan=\"Google AI Ultra\""))
+    }
+
+    @Test func idleGateReusesCacheWithoutTouchingStoredAtAndPenetratesOnActivityOrCeilingOrForce() async throws {
+        let base = self.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let now = Date()
+        let storedAt = now.addingTimeInterval(-600) // 10 分钟前采样（超过 maxAge=240s，但未满 3600s）
+        let seeded = self.antigravityUsage(used: 33, resetsAt: now.addingTimeInterval(3600), fetchedAt: storedAt)
+        SharedCache.writeSuccess(seeded, now: storedAt, baseDirectory: base)
+
+        // 模拟 agy -p 自己退出时在 storedAt + 2s（<= 3s 余量内）刷过一次汇总库
+        let walURL = base.appendingPathComponent("conversation_summaries.db-wal")
+        try Data("wal".utf8).write(to: walURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: storedAt.addingTimeInterval(2.0)],
+            ofItemAtPath: walURL.path
+        )
+
+        let cliCalls = Counter()
+        // A. 闲置轮询（maxAge: 240）-> 0ms 复用缓存，且不覆盖刷新 storedAt
+        let reused = try await AIUsage.fetchCoordinated(
+            .antigravity,
+            maxAge: 240,
+            timeout: 20,
+            baseDirectory: base,
+            statusLineURL: base.appendingPathComponent("missing-statusline.json"),
+            antigravityActivityURLs: [walURL],
+            liveFetcher: {
+                await cliCalls.increment()
+                return self.antigravityUsage(used: 55)
+            }
+        )
+        #expect(await cliCalls.value() == 0)
+        #expect(reused.windows.first?.usedPercent == 33)
+        let afterIdleRecord = SharedCache.readRecord(for: .antigravity, baseDirectory: base)
+        #expect(abs((afterIdleRecord?.storedAt ?? .distantPast).timeIntervalSince(storedAt)) < 1.0)
+
+        // B. 手动强制刷新（maxAge: 0）-> 穿透闲置门控
+        let forced = try await AIUsage.fetchCoordinated(
+            .antigravity,
+            maxAge: 0,
+            timeout: 20,
+            baseDirectory: base,
+            statusLineURL: base.appendingPathComponent("missing-statusline.json"),
+            antigravityActivityURLs: [walURL],
+            liveFetcher: {
+                await cliCalls.increment()
+                return self.antigravityUsage(used: 44)
+            }
+        )
+        #expect(await cliCalls.value() == 1)
+        #expect(forced.windows.first?.usedPercent == 44)
+
+        // C. 重新种入 10 分钟前缓存，但汇总库在 storedAt + 10s 有新会话写入 -> 触发真实查询
+        SharedCache.writeSuccess(seeded, now: storedAt, baseDirectory: base)
+        try FileManager.default.setAttributes(
+            [.modificationDate: storedAt.addingTimeInterval(10.0)],
+            ofItemAtPath: walURL.path
+        )
+        let afterActivity = try await AIUsage.fetchCoordinated(
+            .antigravity,
+            maxAge: 240,
+            timeout: 20,
+            baseDirectory: base,
+            statusLineURL: base.appendingPathComponent("missing-statusline.json"),
+            antigravityActivityURLs: [walURL],
+            liveFetcher: {
+                await cliCalls.increment()
+                return self.antigravityUsage(used: 66)
+            }
+        )
+        #expect(await cliCalls.value() == 2)
+        #expect(afterActivity.windows.first?.usedPercent == 66)
+
+        // D. 超过 60 分钟（3605s）兜底上限 -> 即使无汇总文件活动也穿透刷新
+        let expiredCeilingAt = now.addingTimeInterval(-3605)
+        SharedCache.writeSuccess(seeded, now: expiredCeilingAt, baseDirectory: base)
+        _ = try await AIUsage.fetchCoordinated(
+            .antigravity,
+            maxAge: 240,
+            timeout: 20,
+            baseDirectory: base,
+            statusLineURL: base.appendingPathComponent("missing-statusline.json"),
+            antigravityActivityURLs: [],
+            liveFetcher: {
+                await cliCalls.increment()
+                return self.antigravityUsage(used: 77)
+            }
+        )
+        #expect(await cliCalls.value() == 3)
+
+        let idleLog = try String(contentsOf: base.appendingPathComponent("logs/usage.log"), encoding: .utf8)
+        #expect(idleLog.contains("IDLE_REUSE action=skip_agy"))
+        #expect(idleLog.contains("summaryFile=conversation_summaries.db-wal"))
+        #expect(idleLog.contains("LIVE_SPAWN_REASON reason=force_refresh(maxAge=0)"))
+        #expect(idleLog.contains("LIVE_SPAWN_REASON reason=activity_detected(file=conversation_summaries.db-wal"))
+        #expect(idleLog.contains("LIVE_SPAWN_REASON reason=idle_ceiling_60m"))
+    }
+
+    @Test func offlineFallbackAndEmptyWindowsAreRejectedPreservingPreviousCacheWith120sBackoff() async throws {
+        let base = self.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let now = Date()
+        let oldAt = now.addingTimeInterval(-4000) // 超过 60m 上限以触发 liveFetcher
+        let validCached = self.antigravityUsage(used: 48, resetsAt: now.addingTimeInterval(3600), fetchedAt: oldAt)
+        SharedCache.writeSuccess(validCached, now: oldAt, baseDirectory: base)
+
+        // 模拟 CodexBarCore 回退到 antigravity.offline（空窗口）
+        await #expect(throws: AIUsageError.self) {
+            _ = try await AIUsage.fetchCoordinated(
+                .antigravity,
+                maxAge: 240,
+                timeout: 20,
+                baseDirectory: base,
+                statusLineURL: base.appendingPathComponent("missing-statusline.json"),
+                antigravityActivityURLs: [],
+                liveFetcher: {
+                    ProviderUsage(
+                        provider: .antigravity,
+                        plan: nil,
+                        accountEmail: nil,
+                        windows: [],
+                        fetchedAt: Date(),
+                        source: "antigravity.offline"
+                    )
+                }
+            )
+        }
+
+        // 旧有效窗口必须完整保留，且退避时长为 120s
+        let preserved = SharedCache.readRecord(for: .antigravity, baseDirectory: base)
+        #expect(preserved?.windows.first?.usedPercent == 48)
+        #expect(preserved?.source == "antigravity.cli-https")
+        #expect(preserved?.lastErrorKind == "failed")
+        let retryRemaining = (preserved?.retryAfter ?? .distantPast).timeIntervalSinceNow
+        #expect(retryRemaining > 100 && retryRemaining <= 125)
+
+        let offlineLog = try String(contentsOf: base.appendingPathComponent("logs/usage.log"), encoding: .utf8)
+        #expect(offlineLog.contains("OFFLINE_GUARD_REJECTED strategyID=antigravity.offline"))
+        #expect(offlineLog.contains("preservedCachedWindows=2"))
+    }
+
+    @Test func retryLimitedToGrokAndBoundedFetchPropagatesCancellation() async throws {
+        let base = self.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        #expect(AIUsage.effectiveLiveTimeout(for: .antigravity, requested: 60) == 20)
+        #expect(AIUsage.effectiveLiveTimeout(for: .antigravity, requested: 8) == 8)
+        #expect(AIUsage.effectiveLiveTimeout(for: .claude, requested: 60) == 60)
+
+        // 1. Antigravity 报错不重试（仅执行 1 次）
+        let agyAttempts = Counter()
+        await #expect(throws: AIUsageError.self) {
+            _ = try await AIUsage.runWithProviderRetry(.antigravity, baseDirectory: base) {
+                await agyAttempts.increment()
+                throw AIUsageError(provider: .antigravity, message: "auth error", kind: .failed)
+            }
+        }
+        #expect(await agyAttempts.value() == 1)
+
+        // 2. Grok 首次报错会重试第 2 次并成功
+        let grokAttempts = Counter()
+        let grokOK = try await AIUsage.runWithProviderRetry(.grok, baseDirectory: base) {
+            await grokAttempts.increment()
+            if await grokAttempts.value() == 1 {
+                throw AIUsageError(provider: .grok, message: "3s billing timeout", kind: .failed)
+            }
+            return ProviderUsage(
+                provider: .grok,
+                plan: "SuperGrok",
+                accountEmail: nil,
+                windows: [],
+                fetchedAt: Date(),
+                source: "grok.cli"
+            )
+        }
+        #expect(await grokAttempts.value() == 2)
+        #expect(grokOK.plan == "SuperGrok")
+
+        // 3. runBounded 超时时立即调用 worker.cancel()，向工作闭包传播取消信号
+        let cancelledFlag = FlagBox()
+        await #expect(throws: AIUsageError.self) {
+            _ = try await AIUsage.runBounded(.antigravity, timeout: 0.15, reapNames: []) {
+                try await withTaskCancellationHandler {
+                    try await Task.sleep(for: .seconds(10))
+                    return self.antigravityUsage()
+                } onCancel: {
+                    Task { await cancelledFlag.setTrue() }
+                }
+            }
+        }
+        try await Task.sleep(for: .milliseconds(60))
+        #expect(await cancelledFlag.get() == true)
+    }
+}

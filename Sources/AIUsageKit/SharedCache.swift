@@ -16,7 +16,31 @@ import Foundation
 enum SharedCache {
     static let didUpdateNotification = Notification.Name("me.xueshi.AIUsageKit.didUpdate")
     static let failureBackoffSeconds: TimeInterval = 20
+    static let antigravityFailureBackoffSeconds: TimeInterval = 120
+    static let antigravityIdleCeilingSeconds: TimeInterval = 3600
+    static let antigravityActivityGraceSeconds: TimeInterval = 3.0
     private static let maxRecordBytes = 256 * 1024
+
+    static func failureBackoffSeconds(for provider: AIProvider) -> TimeInterval {
+        switch provider {
+        case .antigravity: Self.antigravityFailureBackoffSeconds
+        case .claude, .grok: Self.failureBackoffSeconds
+        }
+    }
+
+    static var defaultAntigravityStatusLineURL: URL {
+        URL(fileURLWithPath: "/tmp/agy_statusline_input.json", isDirectory: false)
+    }
+
+    static var defaultAntigravityActivityURLs: [URL] {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/antigravity-cli", isDirectory: true)
+        return [
+            dir.appendingPathComponent("conversation_summaries.db-wal", isDirectory: false),
+            dir.appendingPathComponent("conversation_summaries.db", isDirectory: false),
+            dir.appendingPathComponent("jetbox_summaries_proto.pb", isDirectory: false),
+        ]
+    }
 
     static var defaultBaseDirectoryURL: URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -117,13 +141,14 @@ enum SharedCache {
         provider: AIProvider,
         errorKind: AIUsageError.Kind,
         now: Date = Date(),
-        backoff: TimeInterval = failureBackoffSeconds,
+        backoff: TimeInterval? = nil,
         baseDirectory: URL? = nil
     ) {
+        let resolvedBackoff = backoff ?? Self.failureBackoffSeconds(for: provider)
         var record = Self.readRecord(for: provider, baseDirectory: baseDirectory)
             ?? DiskRecord(provider: provider, plan: nil, windows: [])
         record.lastAttemptAt = now
-        record.retryAfter = now.addingTimeInterval(backoff)
+        record.retryAfter = now.addingTimeInterval(resolvedBackoff)
         record.lastErrorKind = errorKind.rawValue
         Self.writeRecord(record, for: provider, baseDirectory: baseDirectory)
     }
@@ -183,6 +208,11 @@ enum SharedCache {
         }
         guard let record, let storedAt = record.storedAt, record.hasSnapshot else {
             return .stale(reason: "missing")
+        }
+        if record.provider == .antigravity,
+           record.source == "antigravity.offline" || record.windows.isEmpty
+        {
+            return .stale(reason: "empty_antigravity_snapshot")
         }
         let age = max(0, now.timeIntervalSince(storedAt))
         guard age < maxAge else {
@@ -338,18 +368,53 @@ enum SharedCache {
         )
     }
 
-    // MARK: - Antigravity 本地状态行快路 (/tmp/agy_statusline_input.json)
+    // MARK: - Antigravity 本地状态行快路与闲置「零启动」门控
 
-    /// 当本机 `agy` 会话在 120 秒内刚渲染过状态行且包含全部 5 个配额桶时，直接零成本读取，免去 7.8 秒 `agy -p /usage`。
-    static func readFreshAntigravityStatusLine(maxAge: TimeInterval = 120, now: Date = Date()) -> ProviderUsage? {
-        let path = "/tmp/agy_statusline_input.json"
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let mtime = attrs[.modificationDate] as? Date,
-              now.timeIntervalSince(mtime) <= maxAge,
-              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+    enum StatusLineEvaluation: Sendable {
+        case hit(usage: ProviderUsage, trigger: String, fileAge: TimeInterval)
+        case miss(reason: String)
+    }
+
+    enum IdleGateEvaluation: Sendable {
+        case reuse(
+            usage: ProviderUsage,
+            cacheAge: TimeInterval,
+            summaryDbMtimeDelta: TimeInterval?,
+            latestSummaryFile: String?,
+            nextResetIn: TimeInterval?
+        )
+        case bypass(reason: String)
+    }
+
+    /// 第 1 层快路评估：读取 `/tmp/agy_statusline_input.json` 并产出详细命中/未命中原因供可观测性日志统计。
+    static func evaluateAntigravityStatusLine(
+        maxAge: TimeInterval = 120,
+        cachedStoredAt: Date? = nil,
+        fileURL: URL = defaultAntigravityStatusLineURL,
+        now: Date = Date()
+    ) -> StatusLineEvaluation {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let mtime = attrs[.modificationDate] as? Date
+        else {
+            return .miss(reason: "file_missing")
+        }
+
+        let fileAge = max(0, now.timeIntervalSince(mtime))
+        let freshnessWindow = max(maxAge, 300)
+        let withinWindow = now.timeIntervalSince(mtime) <= freshnessWindow
+        let newerThanCache = cachedStoredAt.map { mtime > $0 } ?? false
+        guard withinWindow || newerThanCache else {
+            return .miss(reason: String(format: "stale(fileAge=%.1fs>%.0fs)", fileAge, freshnessWindow))
+        }
+        guard let data = try? Data(contentsOf: fileURL),
               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let quota = parsed["quota"] as? [String: Any]
-        else { return nil }
+        else {
+            return .miss(reason: "invalid_json")
+        }
+
+        let rawPlan = (parsed["plan_tier"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let plan = (rawPlan?.isEmpty == false) ? rawPlan : nil
 
         let definitions: [(key: String, id: String, title: String, group: String, kind: UsageWindow.Kind, seconds: TimeInterval)] = [
             ("gemini-5h", "antigravity.gemini-5h", "Gemini 5-hour", "Gemini", .session, 5 * 3600),
@@ -369,11 +434,16 @@ enum SharedCache {
             guard let obj = quota[def.key] as? [String: Any] else { continue }
             let rem = (obj["remaining_fraction"] as? NSNumber)?.doubleValue
                 ?? (obj["remainingFraction"] as? NSNumber)?.doubleValue
-            guard let remaining = rem, remaining.isFinite, remaining >= 0, remaining <= 1.5 else { continue }
+            guard let remaining = rem, remaining.isFinite, remaining >= 0, remaining <= 1.5 else {
+                return .miss(reason: "invalid_fraction(\(def.id))")
+            }
             let used = max(0, ((1.0 - min(1.0, remaining)) * 100.0).rounded())
             let resetStr = (obj["reset_time"] as? String) ?? (obj["resetTime"] as? String)
             let resetDate = resetStr.flatMap { isoFrac.date(from: $0) ?? isoPlain.date(from: $0) }
-            guard let resetDate, resetDate > now else { continue }
+            // 只要状态行中存在的任一桶缺少合法重置时间或已跨过重置时间，整份状态行视为跨周期陈旧快照，拒绝采用。
+            guard let resetDate, resetDate > now else {
+                return .miss(reason: "reset_passed(\(def.id))")
+            }
             windows.append(UsageWindow(
                 id: def.id,
                 title: def.title,
@@ -385,14 +455,137 @@ enum SharedCache {
             ))
         }
         // 至少要有基础的 4 个窗口（Gemini + 3P）才算有效快照。
-        guard windows.count >= 4 else { return nil }
-        return ProviderUsage(
+        guard windows.count >= 4 else {
+            return .miss(reason: "insufficient_buckets(\(windows.count))")
+        }
+        let trigger = withinWindow ? "fresh" : "newer_than_cache"
+        let usage = ProviderUsage(
             provider: .antigravity,
-            plan: nil,
+            plan: plan,
             accountEmail: nil,
             windows: windows,
             fetchedAt: mtime,
             source: "antigravity.statusline-file"
         )
+        return .hit(usage: usage, trigger: trigger, fileAge: fileAge)
+    }
+
+    static func readFreshAntigravityStatusLine(
+        maxAge: TimeInterval = 120,
+        cachedStoredAt: Date? = nil,
+        fileURL: URL = defaultAntigravityStatusLineURL,
+        now: Date = Date()
+    ) -> ProviderUsage? {
+        if case let .hit(usage, _, _) = Self.evaluateAntigravityStatusLine(
+            maxAge: maxAge,
+            cachedStoredAt: cachedStoredAt,
+            fileURL: fileURL,
+            now: now
+        ) {
+            return usage
+        }
+        return nil
+    }
+
+    /// 第 2 层门控：检查多个汇总数据库文件的最新修改时间及对应文件名（仅取文件名，不带敏感路径）。
+    static func latestModification(of urls: [URL]) -> (fileName: String, mtime: Date)? {
+        var latest: (fileName: String, mtime: Date)?
+        for url in urls {
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let mtime = attrs[.modificationDate] as? Date
+            else { continue }
+            if let current = latest {
+                if mtime > current.mtime {
+                    latest = (url.lastPathComponent, mtime)
+                }
+            } else {
+                latest = (url.lastPathComponent, mtime)
+            }
+        }
+        return latest
+    }
+
+    static func latestModificationDate(of urls: [URL]) -> Date? {
+        Self.latestModification(of: urls)?.mtime
+    }
+
+    /// 第 2 层闲置「零启动」门控评估，产出详细复用指标或穿透原因（供 `IDLE_REUSE` / `LIVE_SPAWN_REASON` 打点）。
+    static func evaluateIdleAntigravityCache(
+        _ record: DiskRecord?,
+        maxAge: TimeInterval,
+        activityURLs: [URL] = defaultAntigravityActivityURLs,
+        now: Date = Date()
+    ) -> IdleGateEvaluation {
+        guard maxAge > 0 else {
+            return .bypass(reason: "force_refresh(maxAge=0)")
+        }
+        guard let record,
+              record.provider == .antigravity,
+              let storedAt = record.storedAt,
+              let usage = record.toProviderUsage()
+        else {
+            return .bypass(reason: "no_cache")
+        }
+        guard record.source != "antigravity.offline", !usage.windows.isEmpty else {
+            return .bypass(reason: "empty_cache")
+        }
+
+        // 条件 A：所有非 nil 的 window.resetsAt > now
+        var nextResetIn: TimeInterval?
+        for window in usage.windows {
+            guard let resetsAt = window.resetsAt else { continue }
+            if resetsAt <= now {
+                return .bypass(reason: "reset_passed(window=\(window.id))")
+            }
+            let remaining = resetsAt.timeIntervalSince(now)
+            if let currentMin = nextResetIn {
+                if remaining < currentMin { nextResetIn = remaining }
+            } else {
+                nextResetIn = remaining
+            }
+        }
+
+        // 条件 B：距上次真实采样未满 60 分钟兜底上限
+        let cacheAge = max(0, now.timeIntervalSince(storedAt))
+        guard cacheAge < Self.antigravityIdleCeilingSeconds else {
+            return .bypass(reason: String(format: "idle_ceiling_60m(cacheAge=%.0fs)", cacheAge))
+        }
+
+        // 条件 C：汇总文件均不存在，或未晚于 storedAt + 3.0s
+        let latestActivity = Self.latestModification(of: activityURLs)
+        let summaryDelta = latestActivity.map { $0.mtime.timeIntervalSince(storedAt) }
+        if let latestActivity,
+           let delta = summaryDelta,
+           latestActivity.mtime > storedAt.addingTimeInterval(Self.antigravityActivityGraceSeconds)
+        {
+            return .bypass(
+                reason: String(format: "activity_detected(file=%@,delta=%+.1fs)", latestActivity.fileName, delta)
+            )
+        }
+
+        return .reuse(
+            usage: usage,
+            cacheAge: cacheAge,
+            summaryDbMtimeDelta: summaryDelta,
+            latestSummaryFile: latestActivity?.fileName,
+            nextResetIn: nextResetIn
+        )
+    }
+
+    static func reusableIdleAntigravitySnapshot(
+        _ record: DiskRecord?,
+        maxAge: TimeInterval,
+        activityURLs: [URL] = defaultAntigravityActivityURLs,
+        now: Date = Date()
+    ) -> ProviderUsage? {
+        if case let .reuse(usage, _, _, _, _) = Self.evaluateIdleAntigravityCache(
+            record,
+            maxAge: maxAge,
+            activityURLs: activityURLs,
+            now: now
+        ) {
+            return usage
+        }
+        return nil
     }
 }

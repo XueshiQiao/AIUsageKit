@@ -26,7 +26,11 @@ public enum AIUsage {
 
     /// 无锁同步读取指定厂商最近一次跨进程缓存快照（不含 `accountEmail`）。
     public static func cached(_ provider: AIProvider) -> ProviderUsage? {
-        SharedCache.readRecord(for: provider)?.toProviderUsage()
+        guard let record = SharedCache.readRecord(for: provider) else { return nil }
+        if provider == .antigravity, record.source == "antigravity.offline" || record.windows.isEmpty {
+            return nil
+        }
+        return record.toProviderUsage()
     }
 
     /// 无锁同步读取多家厂商最近一次跨进程缓存快照。
@@ -137,8 +141,14 @@ public enum AIUsage {
         maxAge: TimeInterval,
         timeout: TimeInterval,
         baseDirectory: URL?,
+        statusLineURL: URL? = nil,
+        antigravityActivityURLs: [URL]? = nil,
         liveFetcher: @Sendable @escaping () async throws -> ProviderUsage
     ) async throws -> ProviderUsage {
+        let resolvedStatusLineURL = statusLineURL
+            ?? (baseDirectory == nil ? SharedCache.defaultAntigravityStatusLineURL : nil)
+        let resolvedActivityURLs = antigravityActivityURLs
+            ?? (baseDirectory == nil ? SharedCache.defaultAntigravityActivityURLs : [])
         let requestStart = Date()
         UsageLogger.log(
             provider,
@@ -184,7 +194,10 @@ public enum AIUsage {
                 baseDirectory: baseDirectory
             ) else {
                 // 等锁超时：绝不额外再起 CLI（防止持锁进程卡住时多进程雪崩），若有旧缓存则返回旧缓存
-                if let fallback = SharedCache.readRecord(for: provider, baseDirectory: baseDirectory)?.toProviderUsage() {
+                if let fallbackRecord = SharedCache.readRecord(for: provider, baseDirectory: baseDirectory),
+                   !(provider == .antigravity && (fallbackRecord.source == "antigravity.offline" || fallbackRecord.windows.isEmpty)),
+                   let fallback = fallbackRecord.toProviderUsage()
+                {
                     UsageLogger.log(
                         provider,
                         event: "CACHE_FALLBACK_ON_LOCK_TIMEOUT",
@@ -196,11 +209,14 @@ public enum AIUsage {
                 throw AIUsageError(provider: provider, message: "lock acquisition timed out", kind: .timeout)
             }
 
-            // Step 3: 拿到锁后的 Double-Check
+            // Step 3: 拿到锁后的 Double-Check 与多级快路门控
             let afterLockNow = Date()
-            if let record = SharedCache.readRecord(for: provider, baseDirectory: baseDirectory) {
+            let record = SharedCache.readRecord(for: provider, baseDirectory: baseDirectory)
+            if let record {
                 // 3a. 无论 maxAge 是否为 0，只要 storedAt >= requestStart - 1s，说明等锁期间（或抢锁前一瞬）刚被别的进程刷新写盘了！
-                if let storedAt = record.storedAt,
+                let validForPeerReuse = !(provider == .antigravity && (record.source == "antigravity.offline" || record.windows.isEmpty))
+                if validForPeerReuse,
+                   let storedAt = record.storedAt,
                    storedAt >= requestStart.addingTimeInterval(-1.0),
                    let usage = record.toProviderUsage()
                 {
@@ -237,27 +253,122 @@ public enum AIUsage {
                     fileLock.unlock(baseDirectory: baseDirectory)
                     return usage
                 }
+            }
 
-                // 3c. 失败退避保护（非强制刷新时，如果前一个进程刚刚试过且失败了，在 retryAfter 之前不再连续冲击 CLI）
-                if maxAge > 0,
-                   let retryAfter = record.retryAfter,
-                   afterLockNow < retryAfter
-                {
-                    let remaining = retryAfter.timeIntervalSince(afterLockNow)
+            // 3c. Antigravity 第 1 层快路：本地状态行快照（/tmp/agy_statusline_input.json）
+            // 状态行在 max(maxAge, 300) 秒内、或比缓存 storedAt 更新，且所有桶均未过重置时间时，0ms 直接采纳并落盘广播。
+            var statuslineMissReason = "not_checked"
+            if provider == .antigravity {
+                if let statusLineURL = resolvedStatusLineURL {
+                    let slEvalStart = Date()
+                    switch SharedCache.evaluateAntigravityStatusLine(
+                        maxAge: maxAge,
+                        cachedStoredAt: record?.storedAt,
+                        fileURL: statusLineURL,
+                        now: afterLockNow
+                    ) {
+                    case let .hit(fast, trigger, fileAge):
+                        let elapsedMs = Int(Date().timeIntervalSince(slEvalStart) * 1000)
+                        SharedCache.writeSuccess(fast, now: afterLockNow, baseDirectory: baseDirectory)
+                        let planTag = fast.plan.map { "\"\($0)\"" } ?? "none"
+                        UsageLogger.log(
+                            provider,
+                            event: "STATUSLINE_HIT",
+                            fields: [
+                                ("trigger", trigger),
+                                ("fileAge", String(format: "%.1fs", fileAge)),
+                                ("plan", planTag),
+                                ("elapsedMs", "\(elapsedMs)"),
+                                ("windows", UsageLogger.windowsSummary(fast.windows)),
+                            ],
+                            baseDirectory: baseDirectory
+                        )
+                        UsageLogger.log(
+                            provider,
+                            event: "CACHE_WRITE",
+                            fields: [("file", "\(provider.rawValue).json")],
+                            baseDirectory: baseDirectory
+                        )
+                        fileLock.unlock(baseDirectory: baseDirectory)
+                        SharedCache.postUpdateNotification(for: provider, baseDirectory: baseDirectory)
+                        return fast
+                    case let .miss(reason):
+                        statuslineMissReason = reason
+                    }
+                } else {
+                    statuslineMissReason = "disabled"
+                }
+            }
+
+            // 3d. 失败退避保护（非强制刷新时，如果前一个进程刚刚试过且失败了，在 retryAfter 之前不再连续冲击 CLI）
+            if maxAge > 0,
+               let record,
+               let retryAfter = record.retryAfter,
+               afterLockNow < retryAfter
+            {
+                let remaining = retryAfter.timeIntervalSince(afterLockNow)
+                UsageLogger.log(
+                    provider,
+                    event: "BACKOFF_SKIP",
+                    fields: [
+                        ("remaining", String(format: "%.1fs", remaining)),
+                        ("lastErrorKind", record.lastErrorKind ?? "failed"),
+                    ],
+                    baseDirectory: baseDirectory
+                )
+                fileLock.unlock(baseDirectory: baseDirectory)
+                throw AIUsageError(
+                    provider: provider,
+                    message: "backed off after recent failure (retry in \(Int(ceil(remaining)))s)",
+                    kind: .failed
+                )
+            }
+
+            // 3e. Antigravity 第 2 层门控：全局会话汇总库闲置「零启动」复用
+            // 满足闲置条件时直接 0ms 返回缓存快照（不覆盖 storedAt，以便 60m 兜底计时正常推进）。
+            if provider == .antigravity {
+                let idleEvalStart = Date()
+                switch SharedCache.evaluateIdleAntigravityCache(
+                    record,
+                    maxAge: maxAge,
+                    activityURLs: resolvedActivityURLs,
+                    now: afterLockNow
+                ) {
+                case let .reuse(idleUsage, cacheAge, summaryDelta, latestFile, nextResetIn):
+                    let elapsedMs = Int(Date().timeIntervalSince(idleEvalStart) * 1000)
+                    let deltaStr = summaryDelta.map { String(format: "%+.1fs", $0) } ?? "no_files"
+                    let fileStr = latestFile ?? "none"
+                    let resetStr = nextResetIn.map { String(format: "%.0fs", $0) } ?? "none"
                     UsageLogger.log(
                         provider,
-                        event: "BACKOFF_SKIP",
+                        event: "IDLE_REUSE",
                         fields: [
-                            ("remaining", String(format: "%.1fs", remaining)),
-                            ("lastErrorKind", record.lastErrorKind ?? "failed"),
+                            ("action", "skip_agy"),
+                            ("cacheAge", String(format: "%.1fs", cacheAge)),
+                            ("summaryDbMtimeDelta", deltaStr),
+                            ("summaryFile", fileStr),
+                            ("nextResetIn", resetStr),
+                            ("elapsedMs", "\(elapsedMs)"),
+                            ("windows", UsageLogger.windowsSummary(idleUsage.windows)),
                         ],
                         baseDirectory: baseDirectory
                     )
                     fileLock.unlock(baseDirectory: baseDirectory)
-                    throw AIUsageError(
-                        provider: provider,
-                        message: "backed off after recent failure (retry in \(Int(ceil(remaining)))s)",
-                        kind: .failed
+                    return idleUsage
+                case let .bypass(liveReason):
+                    let stripped = Self.strippedSSHVariableNames()
+                    let strippedTag = stripped.isEmpty ? "none" : stripped.joined(separator: ",")
+                    let timeoutCap = Int(Self.effectiveLiveTimeout(for: provider, requested: timeout))
+                    UsageLogger.log(
+                        provider,
+                        event: "LIVE_SPAWN_REASON",
+                        fields: [
+                            ("reason", liveReason),
+                            ("statusline", statuslineMissReason),
+                            ("sshVarsStripped", strippedTag),
+                            ("timeoutCap", "\(timeoutCap)s"),
+                        ],
+                        baseDirectory: baseDirectory
                     )
                 }
             }
@@ -271,22 +382,29 @@ public enum AIUsage {
             let fetchResult: Result<ProviderUsage, Error>
             do {
                 let usage = try await liveFetcher()
+                try Self.validateLiveUsage(
+                    usage,
+                    preservedCachedCount: record?.windows.count ?? 0,
+                    baseDirectory: baseDirectory
+                )
                 fetchResult = .success(usage)
             } catch {
                 fetchResult = .failure(error)
             }
             ProcessInfo.processInfo.endActivity(activity)
-            let durationMs = Int(Date().timeIntervalSince(cliStart) * 1000)
+            let completedNow = Date()
+            let durationMs = Int(completedNow.timeIntervalSince(cliStart) * 1000)
 
-            // Step 5: 写盘 -> 释放锁 -> 释放锁之后再发跨进程通知
+            // Step 5: 写盘（storedAt 取在子进程彻底退出之后） -> 释放锁 -> 释放锁之后再发跨进程通知
             switch fetchResult {
             case let .success(usage):
-                SharedCache.writeSuccess(usage, now: Date(), baseDirectory: baseDirectory)
+                SharedCache.writeSuccess(usage, now: completedNow, baseDirectory: baseDirectory)
                 UsageLogger.log(
                     provider,
                     event: "CLI_SUCCESS",
                     fields: [
                         ("source", usage.source),
+                        ("elapsedMs", "\(durationMs)"),
                         ("durationMs", "\(durationMs)"),
                         ("windows", UsageLogger.windowsSummary(usage.windows)),
                     ],
@@ -304,10 +422,12 @@ public enum AIUsage {
 
             case let .failure(error):
                 let kind = (error as? AIUsageError)?.kind ?? .failed
+                let backoff = SharedCache.failureBackoffSeconds(for: provider)
                 SharedCache.writeFailure(
                     provider: provider,
                     errorKind: kind,
-                    now: Date(),
+                    now: completedNow,
+                    backoff: backoff,
                     baseDirectory: baseDirectory
                 )
                 // 注意：日志绝不打印 error.localizedDescription，防止泄露本地路径或凭据提示
@@ -316,8 +436,9 @@ public enum AIUsage {
                     event: "CLI_FAILURE",
                     fields: [
                         ("kind", kind.rawValue),
+                        ("elapsedMs", "\(durationMs)"),
                         ("durationMs", "\(durationMs)"),
-                        ("backoffSec", "\(Int(SharedCache.failureBackoffSeconds))"),
+                        ("backoffSec", "\(Int(backoff))"),
                     ],
                     baseDirectory: baseDirectory
                 )
@@ -327,31 +448,28 @@ public enum AIUsage {
         }
     }
 
-    private static func fetchLiveWithRetry(
-        _ provider: AIProvider,
-        timeout: TimeInterval,
-        baseDirectory: URL?
-    ) async throws -> ProviderUsage {
-        // Antigravity 便宜快路：如果 /tmp/agy_statusline_input.json 在 120s 内有完整 5 桶配额，直接采用，免去 7.8s CLI
-        if provider == .antigravity,
-           let fast = SharedCache.readFreshAntigravityStatusLine(maxAge: 120)
-        {
-            UsageLogger.log(
-                provider,
-                event: "STATUSLINE_FASTPATH",
-                fields: [("windows", UsageLogger.windowsSummary(fast.windows))],
-                baseDirectory: baseDirectory
-            )
-            return fast
+    static func effectiveLiveTimeout(for provider: AIProvider, requested timeout: TimeInterval) -> TimeInterval {
+        switch provider {
+        case .antigravity: min(timeout, 20)
+        case .claude, .grok: timeout
         }
+    }
 
-        ChildReaper.reap(olderThan: 10 * 60)
+    static func runWithProviderRetry(
+        _ provider: AIProvider,
+        baseDirectory: URL?,
+        attempt: @Sendable () async throws -> ProviderUsage
+    ) async throws -> ProviderUsage {
         do {
-            return try await self.fetchOnce(provider, timeout: timeout)
+            return try await attempt()
         } catch let error as AIUsageError where error.isTimeout || error.isBusy {
             throw error
         } catch {
-            // CodexBar 里 Grok 的 billing 请求写死 3 秒超时，几家同时取、或网络慢时偶尔会超时，重试一次基本都能过。
+            // CodexBar 里 Grok 的 billing 请求写死 3 秒超时，几家同时取、或网络慢时偶尔会超时，重试一次基本都能过；
+            // 仅对 Grok 重试，避免 Antigravity / Claude 出错时重复冷启动重量级子进程。
+            guard provider == .grok else {
+                throw error
+            }
             UsageLogger.log(
                 provider,
                 event: "CLI_RETRY",
@@ -359,38 +477,78 @@ public enum AIUsage {
                 baseDirectory: baseDirectory
             )
             try await Task.sleep(for: .seconds(1))
-            return try await self.fetchOnce(provider, timeout: timeout)
+            return try await attempt()
+        }
+    }
+
+    private static func fetchLiveWithRetry(
+        _ provider: AIProvider,
+        timeout: TimeInterval,
+        baseDirectory: URL?
+    ) async throws -> ProviderUsage {
+        let effectiveTimeout = Self.effectiveLiveTimeout(for: provider, requested: timeout)
+        ChildReaper.reap(olderThan: 10 * 60)
+        return try await Self.runWithProviderRetry(provider, baseDirectory: baseDirectory) {
+            try await self.fetchOnce(provider, timeout: effectiveTimeout)
         }
     }
 
     private static func fetchOnce(_ provider: AIProvider, timeout: TimeInterval) async throws -> ProviderUsage {
+        try await Self.runBounded(
+            provider,
+            timeout: timeout,
+            reapNames: [ChildReaper.executableName(for: provider)]
+        ) {
+            try await self.fetchUnbounded(provider)
+        }
+    }
+
+    static func runBounded(
+        _ provider: AIProvider,
+        timeout: TimeInterval,
+        reapNames: Set<String> = [],
+        work: @Sendable @escaping () async throws -> ProviderUsage
+    ) async throws -> ProviderUsage {
         guard await InFlight.shared.begin(provider) else {
             throw AIUsageError(provider: provider, message: "previous fetch is still running", kind: .busy)
         }
         let startedAt = Date()
         let race = Race<ProviderUsage>()
 
-        // 真正取数的任务。它可能卡住；只有它真正结束时才释放「正在跑」的标记。
-        Task.detached {
+        // 真正取数的受控任务：保留句柄以便在超时或外部取消时立即传播协作式取消（中止后续 fallback 策略链），
+        // 且只有底层真正结束时才释放「正在跑」的标记。
+        let worker = Task.detached {
             do {
-                race.finish(.success(try await self.fetchUnbounded(provider)))
+                race.finish(.success(try await work()))
             } catch {
                 race.finish(.failure(error))
             }
             await InFlight.shared.end(provider)
         }
-        // 计时器。到点先返回超时，再清理这次启动的子进程，让卡住的那次也能尽快结束。
+        // 计时器：到点先取消 worker 任务传播取消信号，再清理本次启动的子进程组。
         let timer = Task.detached {
             try? await Task.sleep(for: .seconds(timeout))
             guard !Task.isCancelled else { return }
             let timeoutError = AIUsageError(
                 provider: provider, message: "timed out after \(Int(timeout))s", kind: .timeout)
             if race.finish(.failure(timeoutError)) {
-                ChildReaper.reap(names: [ChildReaper.executableName(for: provider)], startedAfter: startedAt)
+                worker.cancel()
+                if !reapNames.isEmpty {
+                    ChildReaper.reap(names: reapNames, startedAfter: startedAt)
+                }
             }
         }
         defer { timer.cancel() }
-        return try await race.value()
+
+        return try await withTaskCancellationHandler {
+            try await race.value()
+        } onCancel: {
+            timer.cancel()
+            worker.cancel()
+            if race.finish(.failure(CancellationError())), !reapNames.isEmpty {
+                ChildReaper.reap(names: reapNames, startedAfter: startedAt)
+            }
+        }
     }
 
     // MARK: - 底层 CodexBarCore 取数
@@ -438,23 +596,74 @@ public enum AIUsage {
         switch outcome.result {
         case let .success(result):
             let usage = result.usage
-            return ProviderUsage(
+            let mapped = ProviderUsage(
                 provider: provider,
                 plan: usage.loginMethod(for: route.id),
                 accountEmail: usage.accountEmail(for: route.id),
                 windows: UsageMapping.windows(for: provider, snapshot: usage),
                 fetchedAt: usage.updatedAt,
                 source: result.strategyID)
+            let existingCachedCount = SharedCache.readRecord(for: provider)?.windows.count ?? 0
+            try Self.validateLiveUsage(mapped, preservedCachedCount: existingCachedCount, baseDirectory: nil)
+            return mapped
         case let .failure(error):
             throw AIUsageError(provider: provider, message: error.localizedDescription)
         }
     }
 
-    /// 从 Finder / launchd 启动的 App 拿到的 PATH 很短，找不到 `claude`、`grok`、`agy`。
-    /// 这里把常见安装位置补进去；同时去掉允许导入浏览器 Cookie 的开关，确保那条路一直关着。
-    private static func environment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT")
+    /// 拒绝把不含真实配额的离线会话计数兜底（`antigravity.offline`）或空窗口当成成功快照覆写磁盘缓存，并记录拦截日志。
+    static func validateLiveUsage(
+        _ usage: ProviderUsage,
+        preservedCachedCount: Int = 0,
+        baseDirectory: URL? = nil
+    ) throws {
+        if usage.provider == .antigravity {
+            if usage.source == "antigravity.offline" || usage.windows.isEmpty {
+                let reason = usage.source == "antigravity.offline" ? "offline_strategy" : "empty_windows"
+                UsageLogger.log(
+                    .antigravity,
+                    event: "OFFLINE_GUARD_REJECTED",
+                    fields: [
+                        ("strategyID", usage.source),
+                        ("reason", reason),
+                        ("windowsCount", "\(usage.windows.count)"),
+                        ("preservedCachedWindows", "\(preservedCachedCount)"),
+                    ],
+                    baseDirectory: baseDirectory
+                )
+                throw AIUsageError(
+                    provider: .antigravity,
+                    message: usage.source == "antigravity.offline"
+                        ? "offline fallback carries no quota data"
+                        : "no quota windows returned",
+                    kind: .failed
+                )
+            }
+        }
+    }
+
+    private static let sshEnvKeys = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+
+    static func strippedSSHVariableNames(
+        from base: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        Self.sshEnvKeys.filter { key in
+            guard let val = base[key] else { return false }
+            return !val.isEmpty
+        }
+    }
+
+    /// 从 Finder / launchd / tmux 启动的桌面 App 可能缺少常见安装路径或继承了残留的 SSH 环境变量：
+    /// - 补全常见 CLI 路径；
+    /// - 剥离浏览器 Cookie 导入开关；
+    /// - 剥离 `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY`，防止 `agy` 误判为远程 SSH 会话切到文件凭证与本机 Keychain 双轨冲突；
+    /// - 注入 `AGY_CLI_DISABLE_AUTO_UPDATE=true`，禁止用量探针触发 `agy` 后台自更新。
+    static func environment(from base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var env = base
+        for key in ["CODEXBAR_ALLOW_BROWSER_COOKIE_IMPORT"] + Self.sshEnvKeys {
+            env.removeValue(forKey: key)
+        }
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let extra = [
             "\(home)/.local/bin", "\(home)/.grok/bin", "\(home)/.claude/local",
